@@ -1,0 +1,761 @@
+---
+title: "TextSimilarity"
+output: html_document
+date: "2025-05-21"
+---
+# 0. setup - Load Libraries and Files
+```{r setup, include=FALSE}
+
+#Libraries
+library(tidyverse)
+library(text2vec)
+library(readr)
+library(jsonlite)
+library(httr)
+library(dplyr)
+library(purrr)
+
+#File paths
+base_path <- "/Users/nagamdakwar/Desktop/ResearchProject/Final/"
+answers_file <- paste0(base_path, "answers.csv")
+questionnaire_file <-paste0(base_path, "Proposal_Questionnaires_Data_Aggregated.csv")
+```
+
+# 1. Lemmatization
+```{r lemmatization}
+#BaseWords function - converts words to base words
+BaseWords <- function(words) {
+  headers <- c('Content-Type' = 'application/json;charset=utf-8')
+
+  data_string <- paste(words, collapse = " ")
+
+  params <- list(
+    task = "nakdan",
+    genre = "modern",
+    data = data_string,
+    addmorph = TRUE,
+    matchpartial = TRUE,
+    keepmetagim = FALSE,
+    keepqq = FALSE,
+    apiKey = "4b65be84-35f2-443b-ab3d-b18f3b82b27d"
+  )
+
+  response <- POST(
+    url = "https://nakdan-3-2.loadbalancer.dicta.org.il/addnikud",
+    add_headers(.headers = headers),
+    body = params,
+    encode = "json"
+  )
+
+  if (response$status_code != 200) {
+    error_content <- content(response, as = "text", encoding = "UTF-8")
+    stop("API request failed with status code: ", response$status_code, 
+         "\nResponse content:\n", error_content)
+  }
+
+  content_text <- content(response, as = "text", encoding = "UTF-8")
+  response_data <- fromJSON(content_text, simplifyVector = FALSE)
+
+  base_words <- character(length(words))
+  response_words <- sapply(response_data, function(x) x$word)
+
+  for (i in seq_along(words)) {
+    idx <- which(response_words == words[i])
+    if (length(idx) == 0) {
+      base_words[i] <- words[i]
+    } else {
+      word_info <- response_data[[idx[1]]]
+      if (!is.null(word_info$options) && length(word_info$options) > 0) {
+        base_word <- word_info$options[[1]]$lex
+      } else {
+        base_word <- word_info$word
+      }
+      base_words[i] <- ifelse(!is.null(base_word) && base_word != "", base_word, words[i])
+    }
+  }
+
+  return(base_words)
+}
+
+#remove all spaces and punctuation from text
+tokenize_words <- function(text) {
+  str_split(text, "\\s+") %>% unlist() %>%
+    str_remove_all("[[:punct:]]") %>%
+    str_to_lower() %>%
+    .[. != ""]
+}
+```
+
+# 2. Reading Data from .csv File
+```{r read-data}
+
+df_answers <- read_csv(answers_file)
+
+#convert question columns to rows
+df_answers <- df_answers %>%
+  pivot_longer(
+    cols = starts_with("Q"),
+    names_to = "question",
+    names_prefix = "Q",
+    values_to = "text"             
+  )
+
+#extract subject info
+df_answers <- df_answers %>%
+  mutate(
+    subject_id = subject,
+    dyad = as.integer(str_extract(subject, "(?<=_)[0-9]{2}(?=_)")),
+    gender = str_extract(subject, "[MF]$"),
+    question = as.integer(question),
+    text = replace_na(text, "")     
+  )
+
+glimpse(df_answers)
+
+```
+
+# 3. Lemmatize Data
+```{r lemmatize-data}
+
+#converting words to basewords
+df_answers_lemma <- df_answers %>%
+  mutate(
+    tokens = map(text, tokenize_words),
+    tokens_lemma = map(tokens, BaseWords),
+    text_lemma = map_chr(tokens_lemma, ~ paste(.x, collapse = " "))
+  )
+glimpse(df_answers_lemma)
+```
+
+#4. Build Dictionaries - 6 questions and overall
+
+```{r Build-Dictionaries}
+#find words with 2 characters or less
+short_tokens <- df_answers_lemma %>%
+  pull(text_lemma) %>%
+  str_split("\\s+") %>%
+  unlist() %>%
+  str_remove_all("[[:punct:]]") %>%
+  str_to_lower() %>%
+  .[nchar(.) <= 2 & . != ""] %>%
+  unique()
+
+build_dictionary <- function(data) {
+  
+  #words to remove
+  stopwords_to_remove <- c("ה", "ב", "ו", "מ", "ש", "היי", "כש", "לְ", "ט'", "י'", "ד'", "אממ", "ממ", "מו")
+  
+  dict <- data %>%
+    mutate(tokens = map(text, tokenize_words)) %>%
+    unnest(tokens) %>%
+    count(dyad, gender, tokens) %>%
+    pivot_wider(names_from = tokens, values_from = n, values_fill = 0)
+  
+  #extract words that were used only by one subject
+  term_cols <- setdiff(names(dict), c("dyad", "gender"))
+  col_sums <- colSums(dict[term_cols] != 0)
+  rare_words <- names(col_sums[col_sums == 1])
+  
+  cols_to_remove <- union(stopwords_to_remove, union(rare_words, short_tokens))
+  
+  final_dict <- dict %>%
+    select(-any_of(cols_to_remove)) %>%
+    arrange(dyad, gender)
+  
+  return(final_dict)
+}
+
+df_answers_lemma <- df_answers_lemma %>% mutate(text = text_lemma)
+
+Dict_lemma <- build_dictionary(df_answers_lemma)
+
+DictQ_lemma_list <- map(1:6, function(q) {
+  build_dictionary(filter(df_answers_lemma, question == q) %>% 
+                     mutate(text = text_lemma))})
+names(DictQ_lemma_list) <- paste0("DictQ", 1:6, "_lemma")
+```
+
+# 5. Cosine Similarity
+
+```{r cosine-similarity}
+#converts rows into vectors
+convert_to_vectors <- function(dict_df) {
+  dict_df %>%
+    mutate(vector = pmap(select(., -(dyad:gender)), c)) %>%
+    select(dyad, gender, vector)
+}
+
+calculate_CS <- function(subject_vectors) {
+  subject_vectors %>%
+    group_by(dyad) %>%
+    summarise(
+      similarity = {
+        female_vector <- vector[gender == "F"]
+        male_vector <- vector[gender == "M"]
+        if (length(female_vector) == 1 && length(male_vector) == 1) {
+          sim2(matrix(unlist(male_vector[[1]]), nrow = 1),
+               matrix(unlist(female_vector[[1]]), nrow = 1),
+               method = "cosine")[1, 1]
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    )
+}
+
+subject_vectors <- convert_to_vectors(Dict_lemma)
+CS_total <- calculate_CS(subject_vectors) %>%
+  rename(similarity_Total = similarity)
+
+CS_questions <- map2(
+  DictQ_lemma_list,
+  paste0("similarity_Q", 1:6),
+  ~ calculate_CS(convert_to_vectors(.x)) %>% rename(!!.y := similarity)
+)
+
+CS_lemma <- reduce(
+  c(list(CS_total), CS_questions),
+  full_join,
+  by = "dyad"
+)
+
+#save as .csv file
+write_csv(CS_lemma, paste0(base_path, "CS_lemma.csv"))
+```
+
+# 6. Build Null Distribution - CS
+```{r build-null-dist-CS}
+
+set.seed(42)
+
+all_dicts <- c(DictQ_lemma_list, list(Total = Dict_lemma))
+
+null_dist_CS <- function(dict, label, path) {
+  subject_vectors <- dict %>%
+    mutate(vector = pmap(select(., -dyad, -gender), c)) %>%
+    select(dyad, gender, vector)
+  
+  #generate male/ female dicts
+  male_pool <- subject_vectors %>% filter(gender == "M")
+  female_pool <- subject_vectors %>% filter(gender == "F")
+  
+  #non-matching dyads
+  fake_pairs <- crossing(
+    male_pool %>% rename_with(~ paste0("M_", .)),
+    female_pool %>% rename_with(~ paste0("F_", .))
+  ) %>%
+    filter(M_dyad != F_dyad)
+  
+  #calculate cosine similarity
+  calculate_cosine <- function(m_vec, f_vec) {
+    sim2(matrix(unlist(m_vec), nrow = 1),
+         matrix(unlist(f_vec), nrow = 1),
+         method = "cosine")[1, 1]
+  }
+  
+  fake_pairs <- fake_pairs %>%
+    mutate(similarity = map2_dbl(M_vector, F_vector, calculate_cosine))
+  
+ 
+  real_pairs <- subject_vectors %>%
+    group_by(dyad) %>%
+    summarise(
+      similarity = {
+        female_vector <- vector[gender == "F"]
+        male_vector <- vector[gender == "M"]
+        if (length(female_vector) == 1 && length(male_vector) == 1) {
+          sim2(matrix(unlist(male_vector[[1]]), nrow = 1),
+               matrix(unlist(female_vector[[1]]), nrow = 1),
+               method = "cosine")[1, 1]
+        } else {
+          NA_real_
+        }
+      },
+      .groups = "drop"
+    ) %>%
+    drop_na()
+
+  real_mean <- mean(real_pairs$similarity)
+  
+  
+  sample_size <- nrow(real_pairs)
+  n_iterations <- 10000
+  mean_similarities <- replicate(n_iterations, {
+    mean(sample(fake_pairs$similarity, sample_size, replace = TRUE))
+  })
+  
+  p_value <- mean(mean_similarities > real_mean)
+  
+  #plot the distribution
+  hist_plot <- ggplot(data.frame(mean_similarities), aes(x = mean_similarities)) +
+    geom_density(fill = "steelblue", alpha = 0.5, adjust = 1.2) +
+    geom_vline(xintercept = real_mean, color = "red", linetype = "solid", size = 1.2) +
+    labs(
+      title = paste("Null Distribution -", label),
+      subtitle = paste("Mean =", round(real_mean, 3), "| p-value =", round(p_value, 3)),
+      x = "Mean Cosine Similarity",
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme (
+      axis.text = element_text(size = 16),
+      plot.subtitle = element_text(size = 18)
+    )
+  
+  print(hist_plot)
+  
+  #save all 7 distributions - 6 questioons and overall
+  ggsave(filename = file.path(base_path, paste0("NullDistCS_", label, ".png")),
+         plot = hist_plot, width = 9, height = 5)
+  print(label)
+  overall_mean <- mean(mean_similarities)
+  print(overall_mean)
+  null_sd <- sd(mean_similarities)
+  print(null_sd)
+}
+
+dist_path <- paste0(base_path, "CSDistributions/")
+dir.create(dist_path, showWarnings = FALSE, recursive = TRUE)
+
+walk2(
+  all_dicts,
+  names(all_dicts),
+  ~ null_dist_CS(.x, .y, dist_path)
+)
+
+```
+
+# 7. Calculate Pearson Correlations - CS
+```{r calculate-corr-CS}
+questionnaire_df <- read_csv(questionnaire_file)
+
+#merge CS with questionnaire data
+merged_CS <- inner_join(CS_lemma, questionnaire_df, by = "dyad")
+
+# calculate correlations
+get_corr_values <- function(df, similarity_col) {
+  numeric_df <- df %>%
+    select(all_of(c(similarity_col, "Closeness", "RAS_mean", "IRIC_PT_mean", "IRIC_EC_mean"))) %>%
+    drop_na()
+
+  cor_matrix <- cor(numeric_df, method = "pearson")
+  return(cor_matrix[similarity_col, c("Closeness", "RAS_mean", "IRIC_PT_mean", "IRIC_EC_mean")])
+}
+
+#plot correlations
+plot_bar_corr <- function(filename, correlation_values, title) {
+  df <- tibble(
+    Measure = names(correlation_values),
+    Correlation = as.numeric(correlation_values)
+  )
+
+  plot <- ggplot(df, aes(x = Measure, y = Correlation, fill = Correlation > 0)) +
+    geom_col(width = 0.6, show.legend = FALSE) +
+    geom_text(aes(label = round(Correlation, 2)),
+              vjust = ifelse(df$Correlation > 0, -0.4, 1.3), size = 5) +
+    scale_y_continuous(limits = c(-1, 1), expand = expansion(mult = c(0.1, 0.1))) +
+    scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "steelblue")) +
+    labs(title = title,
+         y = "Pearson Correlation Coefficient",
+         x = NULL) +
+    theme_minimal(base_size = 14) +
+    theme (
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 14))
+  
+  print(plot)
+
+  ggsave(filename, plot, width = 10, height = 6, dpi = 300)
+}
+
+print(plot_bar_corr)
+
+# get all cosine columns 
+similarity_columns <- colnames(CS_lemma)[grepl("^similarity_", colnames(CS_lemma))]
+
+for (col_name in similarity_columns) {
+  correlations <- get_corr_values(merged_CS, col_name)
+
+  plot_bar_corr(
+    filename = paste0(base_path, col_name, "_correlation.png"),
+    correlation_values = correlations,
+    title = paste("Correlation with", col_name)
+  )
+}
+
+
+```
+
+# 8. TTR calculation
+```{r TTR-calculate}
+#compute TTR from a dict_lemma
+compute_ttr_from_dict <- function(dict_df, question_label) {
+  dict_df %>%
+    rowwise() %>%
+    mutate(
+      num_tokens = sum(c_across(-c(dyad, gender))),
+      num_types = sum(c_across(-c(dyad, gender)) > 0),
+      !!paste0("TTR_", question_label) := ifelse(num_tokens > 0, num_types / num_tokens, NA_real_)
+    ) %>%
+    ungroup() %>%
+    select(dyad, gender, !!paste0("TTR_", question_label))
+}
+
+#calculate TTR in all question dictionaries
+TTR_list <- map2(
+  DictQ_lemma_list,
+  1:6,
+  ~ compute_ttr_from_dict(.x, as.character(.y))
+)
+
+#all question TTR results in one dataFrame 
+TTR_results_lemma <- reduce(TTR_list, full_join, by = c("dyad", "gender"))
+
+#calculate 6 questions and overall 
+TTR_results_lemma <- TTR_results_lemma %>%
+  rowwise() %>%
+  mutate(TTR_Total = mean(c_across(starts_with("TTR_")), na.rm = TRUE)) %>%
+  ungroup()
+
+glimpse(TTR_results_lemma)
+```
+
+# 9. calculate TTRD for couples
+```{r calculate-TTRD}
+#calculate TTRD for each couple
+TTRD_results_lemma <- TTR_results_lemma %>%
+  select(dyad, gender, starts_with("TTR_"), TTR_Total)%>%
+  pivot_wider(
+    names_from = gender,
+    values_from = c(TTR_1, TTR_2, TTR_3, TTR_4, TTR_5, TTR_6, TTR_Total),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    TTRD_Q1 = abs(TTR_1_M - TTR_1_F),
+    TTRD_Q2 = abs(TTR_2_M - TTR_2_F),
+    TTRD_Q3 = abs(TTR_3_M - TTR_3_F),
+    TTRD_Q4 = abs(TTR_4_M - TTR_4_F),
+    TTRD_Q5 = abs(TTR_5_M - TTR_5_F),
+    TTRD_Q6 = abs(TTR_6_M - TTR_6_F),
+    TTRD_Total = abs(TTR_Total_M - TTR_Total_F)
+  ) %>%
+  select(dyad, starts_with("TTRD_"))
+
+#save
+write_csv(TTRD_results_lemma, paste0(base_path, "TTRD_results_lemma.csv"))
+```
+
+# 10. Build Null Distribution - TTRD
+```{r build-null-dist-TTRD}
+
+set.seed(42)
+
+#generate TTR data frame for male/female
+ttr_male <- TTR_results_lemma %>% filter(gender == "M")
+ttr_female <- TTR_results_lemma %>% filter(gender == "F")
+
+#calculate TTRD for real couples
+real_TTRD <- ttr_male %>%
+  inner_join(ttr_female, by = "dyad", suffix = c("_M", "_F")) %>%
+  transmute(
+    dyad,
+    TTRD_Q1 = abs(TTR_1_M - TTR_1_F),
+    TTRD_Q2 = abs(TTR_2_M - TTR_2_F),
+    TTRD_Q3 = abs(TTR_3_M - TTR_3_F),
+    TTRD_Q4 = abs(TTR_4_M - TTR_4_F),
+    TTRD_Q5 = abs(TTR_5_M - TTR_5_F),
+    TTRD_Q6 = abs(TTR_6_M - TTR_6_F),
+    TTRD_Total = abs(TTR_Total_M - TTR_Total_F)
+  )
+
+#compute null distribution and plot
+compute_TTRD_null_distribution <- function(real_col, save_name) {
+  sample_size <- nrow(real_TTRD)
+  real_mean <- mean(real_TTRD[[real_col]], na.rm = TRUE)
+
+  fake_pairs <- crossing(
+    ttr_male %>% rename_with(~ paste0("M_", .)),
+    ttr_female %>% rename_with(~ paste0("F_", .))
+  ) %>%
+    filter(M_dyad != F_dyad)
+
+  get_fake_ttrd <- function(m_row, f_row, col_suffix) {
+    abs(m_row[[paste0("TTR_", col_suffix, "_M")]] - f_row[[paste0("TTR_", col_suffix, "_F")]])
+  }
+
+  if (real_col == "TTRD_Total") {
+  col_suffix <- "Total"
+} else {
+  col_suffix <- gsub("TTRD_Q", "", real_col)
+}
+
+  null_means <- replicate(10000, {
+    sampled_pairs <- fake_pairs %>%
+      sample_n(sample_size, replace = TRUE)
+
+    diffs <- map_dbl(seq_len(nrow(sampled_pairs)), function(i) {
+  m_col <- if (col_suffix == "Total") "M_TTR_Total" else paste0("M_TTR_", col_suffix)
+  f_col <- if (col_suffix == "Total") "F_TTR_Total" else paste0("F_TTR_", col_suffix)
+
+  m_val <- sampled_pairs[[m_col]][i]
+  f_val <- sampled_pairs[[f_col]][i]
+
+  if (!is.null(m_val) && !is.null(f_val) && !is.na(m_val) && !is.na(f_val)) {
+    abs(m_val - f_val)
+  } else {
+    NA_real_
+  }
+})
+
+    mean(diffs, na.rm = TRUE)
+  })
+
+  p_value <- mean(null_means < real_mean)
+
+  # plot
+  plot <- ggplot(data.frame(null_means), aes(x = null_means)) +
+    geom_density(fill = "steelblue", alpha = 0.5) +
+    geom_vline(xintercept = real_mean, color = "red", size = 1.2) +
+    labs(
+      title = paste("Null Distribution -", real_col),
+      subtitle = paste("Mean =", round(real_mean, 3), "| p-value =", round(p_value, 3)),
+      x = "Mean Absolute TTR Difference",
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme (
+      axis.text = element_text(size = 16),
+      plot.subtitle = element_text(size = 18)
+    )
+
+  print(plot)
+
+  ggsave(
+    filename = paste0(base_path, "TTRDDistributions/NullDist_", save_name, ".png"),
+    plot = plot, width = 9, height = 5
+  )
+  print(real_col)
+  overall_mean <- mean(null_means)
+  print(overall_mean)
+  null_sd <- sd(null_means)
+  print(null_sd)
+}
+
+#output dir
+dir.create(paste0(base_path, "TTRDDistributions"), showWarnings = FALSE)
+
+ttrd_cols <- colnames(real_TTRD)[-1]
+walk(ttrd_cols, ~ compute_TTRD_null_distribution(.x, .x))
+
+```
+
+# 11. Calculate Pearson Correlations - TTRD
+```{r calculate-corr-TTRD}
+#merge TTRD with questionnaire data
+merged_TTRD <- inner_join(TTRD_results_lemma, questionnaire_df, by = "dyad")
+
+#get TTRD columns
+ttrd_columns <- colnames(TTRD_results_lemma)[grepl("^TTRD_", colnames(TTRD_results_lemma))]
+
+for (col_name in ttrd_columns) {
+  correlations <- get_corr_values(merged_TTRD, col_name)
+
+  plot_bar_corr(
+    filename = paste0(base_path, col_name, "_correlation.png"),
+    correlation_values = correlations,
+    title = paste("Correlation with", col_name)
+  )
+}
+
+```
+
+# 12. Build Frequency Corpus
+```{r build-freq-corpus}
+corpus <- Dict_lemma %>% select(-dyad, -gender)
+total <- colSums(corpus)
+total_sum <- sum(total)
+word_probs <- total / total_sum
+
+word_summary_df <- tibble::tibble(
+  word = names(total),
+  total_frequency = as.integer(total),
+  probability = word_probs
+)
+glimpse(word_summary_df)
+```
+
+# 13. Calculate Frequency per Subject
+```{r calculate-frequency-final}
+#calculate average word probability for each subject
+compute_subject_freq <- function(dict_df, q_index, word_probs) {
+  question_label <- paste0("Q", q_index)
+  prob_col <- paste0("AvgProb_", question_label)
+
+  term_cols <- setdiff(names(dict_df), c("dyad", "gender"))
+
+  dict_df %>%
+    rowwise() %>%
+    mutate(
+      total_count = sum(c_across(all_of(term_cols))),
+      weighted_sum = sum(c_across(all_of(term_cols)) * word_probs[term_cols], na.rm = TRUE),
+      !!prob_col := ifelse(total_count > 0, weighted_sum / total_count, NA_real_)
+    ) %>%
+    ungroup() %>%
+    select(dyad, gender, !!prob_col)
+}
+
+#calculate to 6 questions
+subject_freq_list <- map2(DictQ_lemma_list, 1:6, ~ compute_subject_freq(.x, .y, word_probs))
+
+#merge all questions into a one dataframe
+subject_frequency <- reduce(subject_freq_list, full_join, by = c("dyad", "gender"))
+
+#add total average
+subject_frequency <- subject_frequency %>%
+  rowwise() %>%
+  mutate(Total = mean(c_across(starts_with("AvgProb_Q")), na.rm = TRUE)) %>%
+  ungroup()
+
+final_subject_frequency_raw <- subject_frequency
+#save to CSV
+write_csv(subject_frequency, paste0(base_path, "subject_avg_probs_final.csv"))
+```
+
+# 14. calculate for couples
+```{r calculate-freqD}
+frequencyD_results <- subject_frequency %>%
+  select(dyad, gender, starts_with("AvgProb_Q"), Total) %>%
+  pivot_wider(
+    names_from = gender,
+    values_from = c(AvgProb_Q1, AvgProb_Q2, AvgProb_Q3, AvgProb_Q4, AvgProb_Q5, AvgProb_Q6, Total),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    frequencyD_Q1 = abs(AvgProb_Q1_M - AvgProb_Q1_F),
+    frequencyD_Q2 = abs(AvgProb_Q2_M - AvgProb_Q2_F),
+    frequencyD_Q3 = abs(AvgProb_Q3_M - AvgProb_Q3_F),
+    frequencyD_Q4 = abs(AvgProb_Q4_M - AvgProb_Q4_F),
+    frequencyD_Q5 = abs(AvgProb_Q5_M - AvgProb_Q5_F),
+    frequencyD_Q6 = abs(AvgProb_Q6_M - AvgProb_Q6_F),
+    frequencyD_Total = abs(Total_M - Total_F)
+  ) %>%
+  select(dyad, starts_with("frequencyD_"))
+
+#save to CSV
+write_csv(frequencyD_results, paste0(base_path, "frequencyD_results.csv"))
+```
+
+# 15. Build Null Distribution - FrequencyD
+```{r build-null-dist-frequencyD}
+set.seed(42)
+
+freq_male <- subject_frequency %>% filter(gender == "M")
+freq_female <- subject_frequency %>% filter(gender == "F")
+
+real_freqD <- freq_male %>%
+  inner_join(freq_female, by = "dyad", suffix = c("_M", "_F")) %>%
+  transmute(
+    dyad,
+    frequencyD_Q1 = abs(AvgProb_Q1_M - AvgProb_Q1_F),
+    frequencyD_Q2 = abs(AvgProb_Q2_M - AvgProb_Q2_F),
+    frequencyD_Q3 = abs(AvgProb_Q3_M - AvgProb_Q3_F),
+    frequencyD_Q4 = abs(AvgProb_Q4_M - AvgProb_Q4_F),
+    frequencyD_Q5 = abs(AvgProb_Q5_M - AvgProb_Q5_F),
+    frequencyD_Q6 = abs(AvgProb_Q6_M - AvgProb_Q6_F),
+    frequencyD_Total = abs(Total_M - Total_F)
+  )
+
+compute_freqD_null_distribution <- function(real_col, save_name) {
+  sample_size <- nrow(real_freqD)
+  real_mean <- mean(real_freqD[[real_col]], na.rm = TRUE)
+  col_suffix <- gsub("frequencyD_", "", real_col)
+
+  fake_pairs <- crossing(
+    freq_male %>% rename_with(~ paste0("M_", .)),
+    freq_female %>% rename_with(~ paste0("F_", .))
+  ) %>% filter(M_dyad != F_dyad)
+
+  null_means <- replicate(10000, {
+    sampled <- fake_pairs %>% sample_n(sample_size, replace = TRUE)
+
+    diffs <- map_dbl(seq_len(nrow(sampled)), function(i) {
+      m_col <- ifelse(col_suffix == "Total", "M_Total", paste0("M_AvgProb_", col_suffix))
+      f_col <- ifelse(col_suffix == "Total", "F_Total", paste0("F_AvgProb_", col_suffix))
+
+
+      m_val <- sampled[[m_col]][i]
+      f_val <- sampled[[f_col]][i]
+
+            if (!is.null(m_val) && !is.null(f_val) &&
+          !is.na(m_val) && !is.na(f_val)) {
+        abs(m_val - f_val)
+      } else {
+        NA_real_
+      }
+
+    })
+
+    mean(diffs, na.rm = TRUE)
+  })
+
+  p_value <- mean(null_means < real_mean)
+
+  plot <- ggplot(data.frame(null_means), aes(x = null_means)) +
+    geom_density(fill = "steelblue", alpha = 0.5) +
+    geom_vline(xintercept = real_mean, color = "red", size = 1.2) +
+    labs(
+      title = paste("Null Distribution -", real_col),
+      subtitle = paste("Mean =", round(real_mean, 3), "| p-value =", round(p_value, 3)),
+      x = "Mean Absolute Frequency Difference",
+      y = "Density"
+    ) +
+    theme_minimal() +
+    theme (
+      axis.text = element_text(size = 16),
+      plot.subtitle = element_text(size = 18)
+    )
+  print(plot)
+
+  ggsave(
+    filename = paste0(base_path, "FreqDDistributions/NullDist_", save_name, ".png"),
+    plot = plot, width = 9, height = 5
+  )
+  print(real_col)
+  overall_mean <- mean(null_means)
+  print(overall_mean)
+  null_sd <- sd(null_means)
+  print(null_sd)
+}
+
+dir.create(paste0(base_path, "FreqDDistributions"), showWarnings = FALSE)
+walk2(
+  colnames(real_freqD)[-1],
+  colnames(real_freqD)[-1],
+  compute_freqD_null_distribution
+)
+
+
+```
+
+# 16. Correlation - FrequencyD
+```{r calculate-corr-frequencyD}
+merged_freqD <- inner_join(frequencyD_results, questionnaire_df, by = "dyad")
+freqd_columns <- colnames(frequencyD_results)[grepl("^frequencyD_", colnames(frequencyD_results))]
+
+for (col_name in freqd_columns) {
+  correlations <- get_corr_values(merged_freqD, col_name)
+
+  plot_bar_corr(
+    filename = paste0(base_path, col_name, "_correlation.png"),
+    correlation_values = correlations,
+    title = paste("Correlation with", col_name)
+  )
+}
+```
+
+
+
+
+
+

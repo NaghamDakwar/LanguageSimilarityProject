@@ -1,0 +1,7 @@
+.DS_Store
+.Rhistory
+.RData
+.Rapp.history
+__pycache__/
+.venv/
+.ipynb_checkpoints/
