@@ -43,7 +43,7 @@ Additionally, for each similarity index, **Pearosn correlation** is computed wit
 
 ## File Overview
 
--`TranscriptsProcessing.py` - Python file that coverts transcripts in .docx format into a file in .csv format. Each row represents a subject, with their transcripts converted into array of strings. 
+- `TranscriptsProcessing.py` – Python file that coverts transcripts in .docx format into a file in .csv format. Each row represents a subject, with their transcripts converted into array of strings. 
 - `TextSimilarity.Rmd` – Main R Markdown file performing the analysis and generating results.
 - `README.md` – This documentation file.
 
@@ -56,7 +56,9 @@ This project was developed and tested using:
 
 - The required **Python packages** are:
 
-`pip install pandas python-docx`
+```r
+pip install pandas python-docx
+```
 
 - The required **R packages** are:
 
