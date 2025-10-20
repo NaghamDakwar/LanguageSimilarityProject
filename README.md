@@ -14,7 +14,7 @@ This analysis is conducted by Python code and R code.
 **Python script**: The input file is a .docx format. 
 - Each subject's transcript starts with a new line. 
 - Each subject is represented by identifier, dyad and gender, underlined and bold (e.g., **<ins>123456789_12_F</ins>**)
-- Each answer is represented by identifier, dyad and question number, underlined (e.g., <u>123456789_12_5</u>)
+- Each answer is represented by identifier, dyad and question number, underlined (e.g., <ins>123456789_12_5</ins>)
 - Each answer starts with a new line under answer identifier.
 
 **R script**: The input file must be a CSV with the following columns:
@@ -34,12 +34,11 @@ The project computes the following indices for each couple:
 
 The similarity indices are calculated:
 
--For each individual answer (there are 6 responses per participant).
--And again for the entire concatenated text (all 6 answers combined).
+- For each individual answer (there are 6 responses per participant), and again for the entire concatenated text (all 6 answers combined).
 
-Each of these indices is compared to **Null Distribution**, built by generating 10,000 samples of random fake couples to evaluate significance.
+- Each of these indices is compared to **Null Distribution**, built by generating 10,000 samples of random fake couples to evaluate significance.
 
-Additionally, for each similarity index, **Pearosn correlation** is computed with **4 questionnaire scores** and measuring relationship satisfaction.
+- Additionally, for each similarity index, **Pearson correlation** is computed with **4 questionnaire scores** and measuring relationship satisfaction.
 
 ## File Overview
 
