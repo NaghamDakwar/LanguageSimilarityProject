@@ -1,5 +1,3 @@
-# LanguageSimilarityProject
-
 # Language Similarity Between Couples - Data Analysis
 
 This project analyzes language similarity among heterosexual couples by computing three similarity metrics in text and examining correlation with relationship measures. 
