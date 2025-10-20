@@ -13,7 +13,7 @@ This analysis is conducted by Python code and R code.
 
 **Python script**: The input file is a .docx format. 
 - Each subject's transcript starts with a new line. 
-- Each subject is represented by identifier, dyad and gender, underlined and bold (e.g., <u>**123456789_12_F**</u>)
+- Each subject is represented by identifier, dyad and gender, underlined and bold (e.g., **<u>123456789_12_F</u>**)
 - Each answer is represented by identifier, dyad and question number, underlined (e.g., <u>123456789_12_5</u>)
 - Each answer starts with a new line under answer identifier.
 
